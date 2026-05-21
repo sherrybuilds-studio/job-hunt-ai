@@ -1,107 +1,117 @@
-import json
 import logging
-import os
 
-from openai import OpenAI
-
-from profile import MY_PROFILE
+from profile import PROFILE
 
 logger = logging.getLogger(__name__)
 
-_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
-_PROFILE_TEXT = MY_PROFILE.as_text()
-_MODEL = "anthropic/claude-3.5-haiku"
+# Terms derived from PROFILE["not_my_skills"] — checked against job titles.
+# Short ambiguous names (R, Go) get padded with spaces so they only match as
+# whole words against the space-padded title string.
+_NOT_MY_SKILL_TERMS: list[str] = []
+for _s in PROFILE["not_my_skills"]:
+    _t = _s.lower()
+    if _t in ("r", "go"):
+        _NOT_MY_SKILL_TERMS.append(f" {_t} ")
+    else:
+        _NOT_MY_SKILL_TERMS.append(_t)
 
-_SYSTEM = """You are a job-fit evaluator. Given a candidate profile and a job posting, return a JSON object with exactly these keys:
-- score: integer 1-100 (how well this job fits the candidate's skills and targets)
-- reasons: list of 2-3 short strings explaining the match
-- red_flags: list of short strings for concerns (empty list if none)
-
-Scoring guide:
-- 80-100: strong match — werkstudent or junior/part-time AI role in Berlin, skills align
-- 60-79: decent match, some relevant skills, worth applying
-- below 60: poor fit, missing key requirements or wrong domain
-
-Penalise heavily (score below 50) if:
-- job is outside Berlin and not remote
-- job requires full-time and does not mention werkstudent or part-time options
-- job requires 3+ years experience or senior seniority
-
-Return ONLY valid JSON with no markdown fences."""
-
-
-_DEALBREAKERS = [
-    "senior required", "5+ years", "management consulting",
-    "vollzeit only", "full-time only", "c++ required",
+# Job must mention at least one of these to pass the must-have filter
+MUST_HAVE = [
+    "werkstudent", "working student", "internship", "part-time student",
+    "student assistant", "studentische", "hiwi", "teilzeit",
+    "part time", "studentenjob", "student job", " intern ",
 ]
-_BONUS_KEYWORDS = ["werkstudent", "part-time", "teilzeit", "junior"]
+
+# (keywords_to_match, points, display_label) — max total = 105
+SKILL_WEIGHTS: list[tuple[list[str], int, str]] = [
+    (["python"], 20, "Python"),
+    (["llm", "claude", "openai", "ai agent", "language model", "gpt", "large language"], 20, "LLM/AI"),
+    (["rag", "vector", "chromadb", "embedding", "retrieval augmented", "vector store"], 15, "RAG/Vectors"),
+    (["fastapi", "flask", " api ", "rest api", "api development"], 10, "FastAPI/API"),
+    (["n8n", "automation", "workflow", "zapier", "process automation"], 15, "n8n/Automation"),
+    (["whatsapp", "meta api", "messaging", "telegram bot", "chatbot", "conversational"], 10, "WhatsApp/Messaging"),
+    (["docker", "linux", "vps", "devops", "kubernetes", "cloud deployment", "server deploy"], 10, "Docker/DevOps"),
+    (["supabase", "postgresql", "postgres", "database", "mysql", " sql "], 5, "Supabase/DB"),
+]
+
+_GERMAN_REQUIRED = [
+    "deutsch c1", "deutsch c2", "c1 deutsch", "c2 deutsch",
+    "german c1", "german c2", "deutschkenntnisse c1", "deutschkenntnisse c2",
+    "verhandlungssicheres deutsch", "fließendes deutsch",
+    "german native", "native german",
+]
+
+# Rough heuristic: 4+ of these common German function words → listing is in German
+_GERMAN_MARKERS = [
+    " wir ", " sie ", " ihr ", " haben ", " werden ", " und ",
+    " oder ", " für ", " mit ", " sind ", " die ", " der ", " das ",
+]
 
 
-_TITLE_DEALBREAKERS = ["senior"]
-
-
-def _check_dealbreakers(job: dict) -> bool:
-    title = job.get("title", "").lower()
-    body = (title + " " + job.get("description", "")).lower()
-    return any(kw in title for kw in _TITLE_DEALBREAKERS) or any(kw in body for kw in _DEALBREAKERS)
-
-
-def _bonus_points(job: dict) -> int:
+def _passes_must_have(job: dict) -> bool:
     haystack = (job.get("title", "") + " " + job.get("description", "")).lower()
-    return 15 if any(kw in haystack for kw in _BONUS_KEYWORDS) else 0
+    return any(kw in haystack for kw in MUST_HAVE)
 
 
 def _score_job(job: dict) -> dict:
-    if _check_dealbreakers(job):
-        return {"score": 0, "reasons": [], "red_flags": ["dealbreaker"]}
+    # Pad with spaces so whole-word substring checks work without regex
+    haystack = " " + (job.get("title", "") + " " + job.get("description", "")).lower() + " "
 
-    job_text = (
-        f"Title: {job['title']}\n"
-        f"Company: {job.get('company', 'Unknown')}\n"
-        f"Salary: {job.get('salary', 'Not specified')}\n"
-        f"Description: {job.get('description', '')}"
-    )
+    score = 0
+    matched_skills: list[str] = []
+    missing_skills: list[str] = []
 
-    response = _client.chat.completions.create(
-        model=_MODEL,
-        max_tokens=512,
-        messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": f"Candidate profile:\n{_PROFILE_TEXT}\n\nJob posting:\n{job_text}"},
-        ],
-    )
+    for keywords, weight, label in SKILL_WEIGHTS:
+        if any(kw in haystack for kw in keywords):
+            score += weight
+            matched_skills.append(label)
+        else:
+            missing_skills.append(label)
 
-    try:
-        raw = response.choices[0].message.content
-        # strip control characters and markdown fences
-        raw = "".join(c for c in raw if c >= " " or c in "\n\r\t")
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        result = json.loads(raw.strip())
-        score = min(100, int(result.get("score", 0)) + _bonus_points(job))
-        return {
-            "score": score,
-            "reasons": result.get("reasons", []),
-            "red_flags": result.get("red_flags", []),
-        }
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Failed to parse score response: {e}")
-        return {"score": 0, "reasons": [], "red_flags": ["parse error"]}
+    # Language adjustment: −20 if German C1/C2 required, +10 if English listing
+    if any(p in haystack for p in _GERMAN_REQUIRED):
+        score -= 20
+        missing_skills.append("German C1/C2 required")
+        red_flags = ["German C1/C2 required"]
+    else:
+        german_word_count = sum(1 for m in _GERMAN_MARKERS if m in haystack)
+        if german_word_count < 4:
+            score += 10
+            matched_skills.append("English listing")
+        red_flags = []
+
+    # Not-my-skills penalty: −15 per term found in the job title (cap −30).
+    # Title is the clearest signal that a skill is the primary requirement.
+    title_padded = " " + job.get("title", "").lower() + " "
+    not_my_penalty = 0
+    for term in _NOT_MY_SKILL_TERMS:
+        if term in title_padded and not_my_penalty < 30:
+            not_my_penalty += 15
+            missing_skills.append(f"Title requires {term.strip()} (not my stack)")
+    score -= not_my_penalty
+
+    return {
+        "score": max(0, score),
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "reasons": matched_skills[:3],
+        "red_flags": red_flags,
+    }
 
 
-def match_jobs(jobs: list[dict], min_score: int = 60) -> list[dict]:
+def match_jobs(jobs: list[dict], min_score: int = 40) -> list[dict]:
     matched = []
     for job in jobs:
+        label = f"{job['title']} @ {job.get('company', '?')}"
+
+        if not _passes_must_have(job):
+            logger.debug(f"Filtered (no werkstudent/intern): {label}")
+            continue
+
         result = _score_job(job)
         score = result["score"]
-        label = f"{job['title']} @ {job.get('company', '?')}"
-        logger.info(f"Score {score}/100 — {label}")
+        logger.info(f"Score {score}/105 — {label}")
+
         if score >= min_score:
             matched.append({**job, **result})
 
